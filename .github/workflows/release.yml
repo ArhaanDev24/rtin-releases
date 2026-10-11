@@ -355,8 +355,9 @@ jobs:
           Invoke-WebRequest "$base/RTIN-Setup-win-x64.exe" -OutFile setup.exe
           Invoke-WebRequest "$base/RTIN-Setup-win-x64.exe.sha256" -OutFile setup.sha256
           if ((Get-Content setup.sha256).Split(' ')[0] -ne (Get-FileHash setup.exe -Algorithm SHA256).Hash.ToLower()) { throw 'Windows checksum mismatch' }
-          $mac = (Invoke-WebRequest "$base/latest-mac.yml").Content
-          $win = (Invoke-WebRequest "$base/latest.yml").Content
+          # GitHub serves these as binary, so read them as text.
+          $mac = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest "$base/latest-mac.yml").RawContentStream.ToArray())
+          $win = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest "$base/latest.yml").RawContentStream.ToArray())
           if ($mac -notmatch "version: ${{ needs.mac.outputs.version }}") { throw "latest-mac.yml: $mac" }
           if ($win -notmatch "version: ${{ needs.mac.outputs.version }}") { throw "latest.yml: $win" }
           "Both platforms serve ${{ needs.mac.outputs.version }}"

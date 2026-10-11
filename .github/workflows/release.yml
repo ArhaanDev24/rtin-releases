@@ -116,7 +116,7 @@ jobs:
           ! grep -rqE "AIza[0-9A-Za-z_-]{30}|sk-[A-Za-z0-9]{20}|xai-[A-Za-z0-9]{20}|gsk_[A-Za-z0-9]{20}" "$RUNNER_TEMP/asar"
       - name: Start the app (Apple Silicon)
         run: node tests/smoke/launch.mjs dist/mac-universal/RTIN.app/Contents/MacOS/RTIN 25
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: rtin-mac
           path: |
@@ -199,7 +199,7 @@ jobs:
           $exe = Join-Path $env:LOCALAPPDATA 'Programs\RTIN\RTIN.exe'
           if (-not (Test-Path $exe)) { throw "RTIN.exe not installed at $exe" }
           node tests/smoke/launch.mjs $exe 25
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: rtin-windows
           path: |

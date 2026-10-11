@@ -188,6 +188,8 @@ jobs:
           npx electron-builder --win --publish never
           (cd dist && sha256sum RTIN-Setup-win-x64.exe > RTIN-Setup-win-x64.exe.sha256)
           grep -q "url: RTIN-Setup-win-x64.exe" dist/latest.yml
+          # The Microsoft Store package (uploaded to Partner Center; Microsoft signs it).
+          test -s dist/RTIN-win-x64.appx
       - name: Native modules load
         run: node -e "require('uiohook-napi'); console.log('uiohook-napi ok')"
       - name: Start the app
@@ -206,6 +208,7 @@ jobs:
             src/app/dist/RTIN-Setup-win-x64.exe
             src/app/dist/RTIN-Setup-win-x64.exe.sha256
             src/app/dist/latest.yml
+            src/app/dist/RTIN-win-x64.appx
           if-no-files-found: error
 
   publish:

@@ -1,0 +1,356 @@
+name: Release RTIN
+
+# Builds RTIN from its private source repo, tests it on real Macs and Windows,
+# publishes one release with both platforms here, then checks that the previous
+# version updates itself to the new one on both.
+#
+# Runs only when someone with write access starts it (Actions → Release RTIN →
+# Run workflow). Builds in this public repo cost nothing; the source stays private:
+# it is checked out with a read-only token and never uploaded.
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#   SOURCE_TOKEN        fine-grained token: ArhaanDev24/RTIN, Contents read-only
+#   MAC_CERT_P12        base64 of RTIN's self-signed certificate (.p12)
+#   MAC_CERT_PASSWORD   its password
+#   MAIN_VITE_GOOGLE_CLIENT_ID, MAIN_VITE_GOOGLE_CLIENT_SECRET   desktop OAuth client
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of ArhaanDev24/RTIN to release
+        default: main
+      publish:
+        description: Publish the release (off = build and test only)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SOURCE: ArhaanDev24/RTIN
+  MAIN_VITE_GOOGLE_CLIENT_ID: ${{ secrets.MAIN_VITE_GOOGLE_CLIENT_ID }}
+  MAIN_VITE_GOOGLE_CLIENT_SECRET: ${{ secrets.MAIN_VITE_GOOGLE_CLIENT_SECRET }}
+
+defaults:
+  run:
+    working-directory: src/app
+
+jobs:
+  mac:
+    name: macOS (universal)
+    runs-on: macos-15
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            src/app/package-lock.json
+            src/website/package-lock.json
+      - name: Use the newest Xcode (FoundationModels needs the macOS 26 SDK)
+        run: |
+          xc=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$xc" ]; then echo "::error::No Xcode 26 on this runner"; ls -d /Applications/Xcode*.app; exit 1; fi
+          sudo xcode-select -s "$xc"
+          xcodebuild -version
+      - name: Install (the app reuses website/src, so both)
+        run: npm ci --legacy-peer-deps && npm ci --prefix ../website
+      - run: npm run typecheck
+      - run: npm test
+      - name: Server tests
+        working-directory: src/api
+        run: npm ci && npm run typecheck && npm test
+      - name: Trust RTIN's signing certificate on this runner
+        env:
+          P12: ${{ secrets.MAC_CERT_P12 }}
+          PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/rtin.p12"
+          openssl pkcs12 -in "$RUNNER_TEMP/rtin.p12" -clcerts -nokeys -passin env:PASSWORD -out "$RUNNER_TEMP/rtin.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/rtin.pem"
+      - name: Build
+        env:
+          CSC_LINK: ${{ runner.temp }}/rtin.p12
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          npm run build
+          npx electron-builder --mac --publish never -c.mac.identity="RTIN Self-Signed Code Signing"
+          node scripts/check-package.mjs dist/mac-universal
+      - name: Check the signature, architectures and update feed
+        run: |
+          app=dist/mac-universal/RTIN.app
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dvv "$app" 2>&1 | grep "Authority=RTIN Self-Signed Code Signing"
+          lipo -archs "$app/Contents/MacOS/RTIN" | grep -q "x86_64 arm64"
+          lipo -archs "$app/Contents/Resources/bin/rtin-helper" | grep -q "x86_64 arm64"
+          (cd dist && shasum -a 256 RTIN-mac-universal.zip > RTIN-mac-universal.zip.sha256 && shasum -a 256 RTIN-mac-universal.dmg > RTIN-mac-universal.dmg.sha256)
+          grep -q "url: RTIN-mac-universal.zip" dist/latest-mac.yml
+          grep -q "repo: rtin-releases" "$app/Contents/Resources/app-update.yml"
+          # Nothing private may ship inside the app.
+          npx asar extract "$app/Contents/Resources/app.asar" "$RUNNER_TEMP/asar"
+          ! grep -rqE "AIza[0-9A-Za-z_-]{30}|sk-[A-Za-z0-9]{20}|xai-[A-Za-z0-9]{20}|gsk_[A-Za-z0-9]{20}" "$RUNNER_TEMP/asar"
+      - name: Start the app (Apple Silicon)
+        run: node tests/smoke/launch.mjs dist/mac-universal/RTIN.app/Contents/MacOS/RTIN 25
+      - uses: actions/upload-artifact@v5
+        with:
+          name: rtin-mac
+          path: |
+            src/app/dist/RTIN-mac-universal.zip
+            src/app/dist/RTIN-mac-universal.zip.sha256
+            src/app/dist/RTIN-mac-universal.dmg
+            src/app/dist/RTIN-mac-universal.dmg.sha256
+            src/app/dist/RTIN-mac-universal.zip.blockmap
+            src/app/dist/latest-mac.yml
+          if-no-files-found: error
+      - name: Remove the certificate
+        if: always()
+        run: rm -f "$RUNNER_TEMP/rtin.p12" "$RUNNER_TEMP/rtin.pem"
+
+  mac-intel:
+    name: macOS (Intel) smoke test
+    needs: mac
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+          sparse-checkout: app/tests/smoke
+      - uses: actions/download-artifact@v5
+        with:
+          name: rtin-mac
+          path: src/app/dist
+      - name: Unpack
+        run: ditto -x -k dist/RTIN-mac-universal.zip dist/unpacked && codesign --verify --deep --strict dist/unpacked/RTIN.app
+      - name: The helper runs natively on Intel
+        run: |
+          file dist/unpacked/RTIN.app/Contents/Resources/bin/rtin-helper
+          node tests/smoke/helper.mjs dist/unpacked/RTIN.app/Contents/Resources/bin/rtin-helper
+      - name: Start the app (Intel)
+        run: node tests/smoke/launch.mjs dist/unpacked/RTIN.app/Contents/MacOS/RTIN 30
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            src/app/package-lock.json
+            src/website/package-lock.json
+      - name: Install (the app reuses website/src, so both)
+        run: npm ci --legacy-peer-deps && npm ci --prefix ../website
+      - run: npm run typecheck
+      - run: npm test
+      - name: Build
+        shell: bash
+        run: |
+          npx electron-vite build
+          npx electron-builder --win --publish never
+          (cd dist && sha256sum RTIN-Setup-win-x64.exe > RTIN-Setup-win-x64.exe.sha256)
+          grep -q "url: RTIN-Setup-win-x64.exe" dist/latest.yml
+      - name: Native modules load
+        run: node -e "require('uiohook-napi'); console.log('uiohook-napi ok')"
+      - name: Start the app
+        run: node tests/smoke/launch.mjs dist/win-unpacked/RTIN.exe 30
+      - name: Install silently and start the installed app
+        shell: pwsh
+        run: |
+          Start-Process -FilePath dist\RTIN-Setup-win-x64.exe -ArgumentList '/S' -Wait
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\RTIN\RTIN.exe'
+          if (-not (Test-Path $exe)) { throw "RTIN.exe not installed at $exe" }
+          node tests/smoke/launch.mjs $exe 25
+      - uses: actions/upload-artifact@v5
+        with:
+          name: rtin-windows
+          path: |
+            src/app/dist/RTIN-Setup-win-x64.exe
+            src/app/dist/RTIN-Setup-win-x64.exe.sha256
+            src/app/dist/latest.yml
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    if: inputs.publish
+    needs: [mac, mac-intel, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+    outputs:
+      previous: ${{ steps.prev.outputs.previous }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      V: ${{ needs.mac.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+      - name: Verify checksums and versions
+        run: |
+          (cd dist/rtin-mac && sha256sum -c RTIN-mac-universal.zip.sha256 RTIN-mac-universal.dmg.sha256)
+          (cd dist/rtin-windows && sha256sum -c RTIN-Setup-win-x64.exe.sha256)
+          grep -qx "version: $V" dist/rtin-mac/latest-mac.yml
+          grep -qx "version: $V" dist/rtin-windows/latest.yml
+      - id: prev
+        name: The release users are on now
+        run: echo "previous=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName | sed 's/^v//')" >> "$GITHUB_OUTPUT"
+      - name: Publish v${{ needs.mac.outputs.version }} (draft until every file is up)
+        run: |
+          tag="v$V"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isDraft -q 'select(.isDraft == false)' 2>/dev/null | grep -q .; then
+            echo "::error::$tag is already published. Bump the version in app/package.json first."; exit 1
+          fi
+          notes="RTIN $V for macOS 13+ (Apple Silicon and Intel) and Windows 10/11.
+
+          macOS: download the .dmg, drag RTIN to Applications, then System Settings → Privacy & Security → Open Anyway the first time.
+          Windows: run RTIN-Setup-win-x64.exe (SmartScreen: More info → Run anyway)."
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$tag" -R "$GITHUB_REPOSITORY" --draft --title "RTIN $V" --notes "$notes"
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber dist/rtin-mac/* dist/rtin-windows/*
+          want=$(ls dist/rtin-mac dist/rtin-windows | grep -v ':' | grep . | sort)
+          have=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | sort)
+          [ "$want" = "$have" ] || { echo "::error::uploaded files don't match"; exit 1; }
+          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag"
+
+  update-mac:
+    name: Auto-update on macOS
+    needs: [mac, publish]
+    if: needs.publish.outputs.previous != '' && needs.publish.outputs.previous != needs.mac.outputs.version
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+    env:
+      FROM: ${{ needs.publish.outputs.previous }}
+      TO: ${{ needs.mac.outputs.version }}
+      BASE: https://github.com/${{ github.repository }}/releases/download
+    steps:
+      - name: Install the version users are on
+        run: |
+          curl -fsSL --retry 3 -o rtin.zip "$BASE/v$FROM/RTIN-mac-universal.zip"
+          ditto -x -k rtin.zip unpacked && ditto unpacked/RTIN.app /Applications/RTIN.app
+      - name: It finds, downloads and verifies the new version
+        run: |
+          log="$HOME/Library/Application Support/RTIN/rtin.log"
+          rm -f "$log"
+          open /Applications/RTIN.app
+          for i in $(seq 1 120); do grep -q "update: $TO downloaded and verified" "$log" 2>/dev/null && break; sleep 5; done
+          cat "$log"
+          grep -q "update: $TO downloaded and verified" "$log"
+      - name: Quitting installs it, signed by RTIN, and it starts
+        run: |
+          osascript -e 'quit app "RTIN"'
+          for i in $(seq 1 60); do v=$(defaults read /Applications/RTIN.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || true); [ "$v" = "$TO" ] && break; sleep 5; done
+          echo "installed: $v"; [ "$v" = "$TO" ]
+          codesign --verify --deep --strict /Applications/RTIN.app
+          codesign -dvv /Applications/RTIN.app 2>&1 | grep "Authority=RTIN Self-Signed Code Signing"
+          log="$HOME/Library/Application Support/RTIN/rtin.log"
+          pkill -x RTIN || true; rm -f "$log"
+          open /Applications/RTIN.app
+          for i in $(seq 1 30); do grep -q "RTIN $TO starting (packaged" "$log" 2>/dev/null && break; sleep 2; done
+          cat "$log"; grep -q "RTIN $TO starting (packaged" "$log"
+
+  update-windows:
+    name: Auto-update on Windows
+    needs: [mac, publish]
+    if: needs.publish.outputs.previous != '' && needs.publish.outputs.previous != needs.mac.outputs.version
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+        shell: pwsh
+    env:
+      FROM: ${{ needs.publish.outputs.previous }}
+      TO: ${{ needs.mac.outputs.version }}
+      BASE: https://github.com/${{ github.repository }}/releases/download
+    steps:
+      - name: Install the version users are on
+        run: |
+          Invoke-WebRequest "$env:BASE/v$env:FROM/RTIN-Setup-win-x64.exe" -OutFile setup.exe
+          Start-Process setup.exe -ArgumentList '/S' -Wait
+      - name: It finds, downloads and verifies the new version
+        run: |
+          $log = Join-Path $env:APPDATA 'RTIN\rtin.log'
+          Remove-Item $log -ErrorAction SilentlyContinue
+          Start-Process "$env:LOCALAPPDATA\Programs\RTIN\RTIN.exe"
+          $want = "update: $env:TO downloaded and verified"
+          for ($i = 0; $i -lt 120; $i++) { if ((Test-Path $log) -and (Select-String -Path $log -SimpleMatch $want -Quiet)) { break }; Start-Sleep 5 }
+          Get-Content $log
+          if (-not (Select-String -Path $log -SimpleMatch $want -Quiet)) { throw 'update was not downloaded' }
+      - name: Quitting installs it, and it starts
+        run: |
+          taskkill /IM RTIN.exe 2>&1 | Out-Null
+          $exe = "$env:LOCALAPPDATA\Programs\RTIN\RTIN.exe"
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep 5
+            $v = "$((Get-Item $exe -ErrorAction SilentlyContinue).VersionInfo.ProductVersion)" -replace '\.0$', ''
+            if ($v -eq $env:TO) { break }
+          }
+          "installed: $v"
+          if ($v -ne $env:TO) { throw "still on $v" }
+          Get-Process RTIN -ErrorAction SilentlyContinue | Stop-Process -Force
+          $log = Join-Path $env:APPDATA 'RTIN\rtin.log'
+          Remove-Item $log -ErrorAction SilentlyContinue
+          Start-Process $exe
+          for ($i = 0; $i -lt 30; $i++) { if ((Test-Path $log) -and (Select-String -Path $log -SimpleMatch "RTIN $env:TO starting (packaged" -Quiet)) { break }; Start-Sleep 2 }
+          Get-Content $log
+          if (-not (Select-String -Path $log -SimpleMatch "RTIN $env:TO starting (packaged" -Quiet)) { throw 'new version did not start' }
+
+  downloads:
+    name: Website downloads
+    needs: [mac, publish]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: .
+        shell: pwsh
+    steps:
+      - name: The website's Windows and Mac downloads are the new version
+        run: |
+          $base = 'https://github.com/${{ github.repository }}/releases/latest/download'
+          Invoke-WebRequest "$base/RTIN-Setup-win-x64.exe" -OutFile setup.exe
+          Invoke-WebRequest "$base/RTIN-Setup-win-x64.exe.sha256" -OutFile setup.sha256
+          if ((Get-Content setup.sha256).Split(' ')[0] -ne (Get-FileHash setup.exe -Algorithm SHA256).Hash.ToLower()) { throw 'Windows checksum mismatch' }
+          $mac = (Invoke-WebRequest "$base/latest-mac.yml").Content
+          $win = (Invoke-WebRequest "$base/latest.yml").Content
+          if ($mac -notmatch "version: ${{ needs.mac.outputs.version }}") { throw "latest-mac.yml: $mac" }
+          if ($win -notmatch "version: ${{ needs.mac.outputs.version }}") { throw "latest.yml: $win" }
+          "Both platforms serve ${{ needs.mac.outputs.version }}"

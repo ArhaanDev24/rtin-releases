@@ -1,0 +1,11 @@
+name: Runner check
+on: workflow_dispatch
+permissions: {}
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo "runner works on ${{ matrix.os }}"

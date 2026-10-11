@@ -145,7 +145,7 @@ jobs:
           path: src
           persist-credentials: false
           sparse-checkout: app/tests/smoke
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: rtin-mac
           path: src/app/dist
@@ -225,7 +225,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       V: ${{ needs.mac.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: dist
       - name: Verify checksums and versions

@@ -82,13 +82,19 @@ jobs:
           P12: ${{ secrets.MAC_CERT_P12 }}
           PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
         run: |
-          echo "$P12" | base64 --decode > "$RUNNER_TEMP/rtin.p12"
-          openssl pkcs12 -in "$RUNNER_TEMP/rtin.p12" -clcerts -nokeys -passin env:PASSWORD -out "$RUNNER_TEMP/rtin.pem"
+          # Pasted secrets often carry a trailing line break; neither value may contain whitespace.
+          pass=$(printf %s "$PASSWORD" | tr -d '\r\n')
+          echo "::add-mask::$pass"
+          printf %s "$P12" | tr -d ' \r\n' | base64 --decode > "$RUNNER_TEMP/rtin.p12"
+          if ! PASS="$pass" openssl pkcs12 -in "$RUNNER_TEMP/rtin.p12" -clcerts -nokeys -passin env:PASS -out "$RUNNER_TEMP/rtin.pem"; then
+            echo "::error::MAC_CERT_P12 or MAC_CERT_PASSWORD is wrong: the certificate couldn't be opened."; exit 1
+          fi
+          grep -q "BEGIN CERTIFICATE" "$RUNNER_TEMP/rtin.pem" || { echo "::error::MAC_CERT_P12 holds no certificate"; exit 1; }
+          echo "CSC_KEY_PASSWORD=$pass" >> "$GITHUB_ENV"
           sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/rtin.pem"
       - name: Build
         env:
           CSC_LINK: ${{ runner.temp }}/rtin.p12
-          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
         run: |
           npm run build
           npx electron-builder --mac --publish never -c.mac.identity="RTIN Self-Signed Code Signing"

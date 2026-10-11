@@ -77,6 +77,8 @@ jobs:
       - name: Server tests
         working-directory: src/api
         run: npm ci && npm run typecheck && npm test
+      - name: Dependencies are safe and supported (fails on high/critical vulnerabilities or an unsupported Electron)
+        run: node scripts/check-deps.mjs
       - name: Trust RTIN's signing certificate on this runner
         env:
           P12: ${{ secrets.MAC_CERT_P12 }}
